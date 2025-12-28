@@ -1,182 +1,216 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
-	"github.com/jmoiron/jsonq"
+	ct "github.com/google/certificate-transparency-go"
+	"github.com/google/certificate-transparency-go/client"
+	"github.com/google/certificate-transparency-go/jsonclient"
+	"github.com/google/certificate-transparency-go/loglist3"
+	"github.com/google/certificate-transparency-go/scanner"
+	"github.com/google/certificate-transparency-go/x509"
 )
 
-const (
-	pingInterval   = 30 * time.Second
-	pongWait       = 60 * time.Second
-	writeWait      = 10 * time.Second
-	reconnectDelay = 5 * time.Second
-	maxReconnect   = 10
-)
-
-type CertstreamClient struct {
-	url        string
-	conn       *websocket.Conn
-	mu         sync.Mutex
-	done       chan struct{}
-	eventChan  chan jsonq.JsonQuery
-	errorChan  chan error
-	reconnects int
+type CertEntry struct {
+	Domains   []string
+	NotBefore time.Time
+	NotAfter  time.Time
+	Issuer    string
+	LogURL    string
 }
 
-func NewCertstreamClient(url string) *CertstreamClient {
-	return &CertstreamClient{
-		url:       url,
-		eventChan: make(chan jsonq.JsonQuery, 5000),
-		errorChan: make(chan error, 100),
-		done:      make(chan struct{}),
+type CTMonitor struct {
+	entryChan chan CertEntry
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+}
+
+func NewCTMonitor() *CTMonitor {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &CTMonitor{
+		entryChan: make(chan CertEntry, 5000),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 }
 
-func (c *CertstreamClient) Connect() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (m *CTMonitor) Start() <-chan CertEntry {
+	go m.run()
+	return m.entryChan
+}
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 30 * time.Second,
-	}
+func (m *CTMonitor) Stop() {
+	m.cancel()
+	m.wg.Wait()
+	close(m.entryChan)
+}
 
-	conn, _, err := dialer.Dial(c.url, nil)
+func (m *CTMonitor) run() {
+	logs, err := fetchLogList()
 	if err != nil {
-		return err
-	}
-
-	c.conn = conn
-	c.reconnects = 0
-	return nil
-}
-
-func (c *CertstreamClient) Start() (chan jsonq.JsonQuery, chan error) {
-	go c.run()
-	return c.eventChan, c.errorChan
-}
-
-func (c *CertstreamClient) Stop() {
-	close(c.done)
-	c.mu.Lock()
-	if c.conn != nil {
-		c.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		c.conn.Close()
-		c.conn = nil
-	}
-	c.mu.Unlock()
-}
-
-func (c *CertstreamClient) run() {
-	for {
-		select {
-		case <-c.done:
-			return
-		default:
-		}
-
-		if err := c.Connect(); err != nil {
-			c.reconnects++
-			if c.reconnects > maxReconnect {
-				c.errorChan <- err
-				c.reconnects = 0
-			}
-			time.Sleep(reconnectDelay)
-			continue
-		}
-
-		c.readLoop()
-
-		select {
-		case <-c.done:
-			return
-		default:
-			time.Sleep(reconnectDelay)
-		}
-	}
-}
-
-func (c *CertstreamClient) readLoop() {
-	c.mu.Lock()
-	conn := c.conn
-	c.mu.Unlock()
-
-	if conn == nil {
+		logger.Error("failed to fetch CT log list", "error", err)
 		return
 	}
 
-	conn.SetReadDeadline(time.Now().Add(pongWait))
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
+	logger.Info("fetched CT log list", "usable_logs", len(logs))
 
-	pingTicker := time.NewTicker(pingInterval)
-	pingDone := make(chan struct{})
+	for _, logInfo := range logs {
+		m.wg.Add(1)
+		go m.monitorLog(logInfo)
+	}
+}
 
-	go func() {
-		defer pingTicker.Stop()
-		for {
-			select {
-			case <-pingTicker.C:
-				c.mu.Lock()
-				if c.conn != nil {
-					c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-					if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-						c.mu.Unlock()
-						return
-					}
-				}
-				c.mu.Unlock()
-			case <-pingDone:
-				return
-			case <-c.done:
-				return
+func fetchLogList() ([]*loglist3.Log, error) {
+	resp, err := http.Get(loglist3.LogListURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch log list: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read log list: %w", err)
+	}
+
+	var ll loglist3.LogList
+	if err := json.Unmarshal(body, &ll); err != nil {
+		return nil, fmt.Errorf("failed to parse log list: %w", err)
+	}
+
+	var usableLogs []*loglist3.Log
+	for _, op := range ll.Operators {
+		for _, log := range op.Logs {
+			if log.State != nil && log.State.Usable != nil {
+				usableLogs = append(usableLogs, log)
 			}
 		}
-	}()
+	}
 
-	defer func() {
-		close(pingDone)
-		c.mu.Lock()
-		if c.conn != nil {
-			c.conn.Close()
-			c.conn = nil
-		}
-		c.mu.Unlock()
-	}()
+	return usableLogs, nil
+}
+
+func (m *CTMonitor) monitorLog(logInfo *loglist3.Log) {
+	defer m.wg.Done()
+
+	logURL := logInfo.URL
+	if !strings.HasPrefix(logURL, "https://") {
+		logURL = "https://" + logURL
+	}
+	logURL = strings.TrimSuffix(logURL, "/")
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+
+	logClient, err := client.New(logURL, httpClient, jsonclient.Options{})
+	if err != nil {
+		logger.Warn("failed to create log client", "log", logInfo.Description, "error", err)
+		return
+	}
+
+	sth, err := logClient.GetSTH(m.ctx)
+	if err != nil {
+		logger.Warn("failed to get STH", "log", logInfo.Description, "error", err)
+		return
+	}
+
+	opts := scanner.FetcherOptions{
+		BatchSize:     256,
+		ParallelFetch: 2,
+		StartIndex:    int64(sth.TreeSize),
+		EndIndex:      0,
+		Continuous:    true,
+	}
+
+	fetcher := scanner.NewFetcher(logClient, &opts)
+
+	logger.Debug("monitoring CT log", "from", logInfo.Description)
 
 	for {
 		select {
-		case <-c.done:
+		case <-m.ctx.Done():
 			return
 		default:
 		}
 
-		_, message, err := conn.ReadMessage()
+		err := fetcher.Run(m.ctx, func(batch scanner.EntryBatch) {
+			for i, entry := range batch.Entries {
+				m.processEntry(entry, batch.Start+int64(i), logURL)
+			}
+		})
+
 		if err != nil {
-			c.errorChan <- err
-			return
-		}
-
-		var data map[string]interface{}
-		if err := json.Unmarshal(message, &data); err != nil {
-			continue
-		}
-
-		jq := jsonq.NewQuery(data)
-
-		select {
-		case c.eventChan <- *jq:
-		default:
+			if m.ctx.Err() != nil {
+				return
+			}
+			time.Sleep(5 * time.Second)
 		}
 	}
 }
 
-func CertStreamEventStream(url string) (chan jsonq.JsonQuery, chan error) {
-	client := NewCertstreamClient(url)
-	return client.Start()
+func (m *CTMonitor) processEntry(entry ct.LeafEntry, index int64, logURL string) {
+	rle, err := ct.RawLogEntryFromLeaf(index, &entry)
+	if err != nil {
+		return
+	}
+
+	var cert *x509.Certificate
+
+	switch rle.Leaf.TimestampedEntry.EntryType {
+	case ct.X509LogEntryType:
+		cert, err = x509.ParseCertificate(rle.Cert.Data)
+	case ct.PrecertLogEntryType:
+		cert, err = x509.ParseTBSCertificate(rle.Cert.Data)
+	default:
+		return
+	}
+
+	if err != nil {
+		return
+	}
+
+	domains := extractDomains(cert)
+	if len(domains) == 0 {
+		return
+	}
+
+	select {
+	case m.entryChan <- CertEntry{
+		Domains:   domains,
+		NotBefore: cert.NotBefore,
+		NotAfter:  cert.NotAfter,
+		Issuer:    cert.Issuer.CommonName,
+		LogURL:    logURL,
+	}:
+	default:
+	}
+}
+
+func extractDomains(cert *x509.Certificate) []string {
+	seen := make(map[string]bool)
+	var domains []string
+
+	if cert.Subject.CommonName != "" {
+		seen[cert.Subject.CommonName] = true
+		domains = append(domains, cert.Subject.CommonName)
+	}
+
+	for _, dns := range cert.DNSNames {
+		if !seen[dns] {
+			seen[dns] = true
+			domains = append(domains, dns)
+		}
+	}
+
+	return domains
+}
+
+func CertStreamEventStream() <-chan CertEntry {
+	monitor := NewCTMonitor()
+	return monitor.Start()
 }

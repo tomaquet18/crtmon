@@ -11,7 +11,6 @@ import (
 	"syscall"
 
 	"github.com/charmbracelet/log"
-	"github.com/jmoiron/jsonq"
 )
 
 const version = "1.0.0"
@@ -27,12 +26,12 @@ var (
 	logger      = log.NewWithOptions(os.Stderr, log.Options{
 		ReportTimestamp: true,
 		TimeFormat:      "15:04:05",
+		Level:           log.DebugLevel,
 	})
 	targets        []string
 	webhookURL     string
 	telegramToken  string
 	telegramChatID string
-	dockerManager  *DockerManager
 	notifyDiscord  bool
 	notifyTelegram bool
 )
@@ -42,14 +41,30 @@ func main() {
 
 	if len(os.Args) > 1 {
 		validFlags := map[string]bool{
-			"-target": true, "-config": true, "-notify": true,
-			"-version": true, "-update": true, "-h": true, "-help": true,
+			"-target": true,
+			"-config": true,
+			"-notify": true,
+			"-version": true,
+			"-update": true,
+			"-h": true, "-help": true,
 		}
 
-		for _, arg := range os.Args[1:] {
-			if strings.HasPrefix(arg, "-") && !validFlags[arg] {
-				displayHelp()
-				return
+		for i, arg := range os.Args[1:] {
+			if strings.HasPrefix(arg, "-") && arg != "-" {
+				flagName := arg
+				if idx := strings.Index(arg, "="); idx != -1 {
+					flagName = arg[:idx]
+				}
+				if !validFlags[flagName] {
+					displayHelp()
+					return
+				}
+			} else if arg == "-" && i > 0 {
+				prevArg := os.Args[i]
+				if !strings.HasPrefix(prevArg, "-") || strings.Contains(prevArg, "=") {
+					displayHelp()
+					return
+				}
 			}
 		}
 	}
@@ -146,16 +161,7 @@ func main() {
 	notifyValue := strings.ToLower(strings.TrimSpace(*notify))
 	switch notifyValue {
 	case "":
-		if discordConfigured && telegramConfigured {
-			notifyDiscord = true
-			notifyTelegram = true
-		} else if discordConfigured {
-			notifyDiscord = true
-		} else if telegramConfigured {
-			notifyTelegram = true
-		} else {
-			logger.Fatal("no notification provider configured. please configure a discord webhook or telegram bot token/chat id")
-		}
+		// No notify flag - notifications off
 	case "discord":
 		if !discordConfigured {
 			logger.Fatal("notify=discord selected but discord webhook is not configured. please configure it in your configuration file (use -config for a custom path)")
@@ -192,34 +198,34 @@ func main() {
 		cancel()
 	}()
 
-	dockerManager = NewDockerManager()
-
-	logger.Info("initializing certstream server")
-	if err := dockerManager.EnsureRunning(ctx); err != nil {
-		logger.Fatal("failed to start certstream server", "error", err)
-	}
-
 	logger.Info("starting crtmon")
 	for i, t := range targets {
 		fmt.Printf("         %d. %s\n", (i + 1), t)
 	}
 
-	wsURL := dockerManager.GetWebSocketURL()
-	logger.Info("connecting to certstream", "url", wsURL)
+	var notifyStatus string
+	if notifyDiscord && notifyTelegram {
+		notifyStatus = "discord, telegram"
+	} else if notifyDiscord {
+		notifyStatus = "discord"
+	} else if notifyTelegram {
+		notifyStatus = "telegram"
+	} else {
+		notifyStatus = "off"
+	}
+	logger.Debug("configuration", "targets", len(targets), "notification", notifyStatus)
 
-	stream, errStream := CertStreamEventStream(wsURL)
+	logger.Info("connecting to certificate transparency logs")
+
+	stream := CertStreamEventStream()
 
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Info("goodbye")
 			return
-		case jq := <-stream:
-			processMessage(jq)
-		case err := <-errStream:
-			if err != nil {
-				logger.Warn("certstream error", "error", err.Error())
-			}
+		case entry := <-stream:
+			processEntry(entry)
 		}
 	}
 }
@@ -272,18 +278,8 @@ func loadTargetsFromStdin() ([]string, error) {
 	return targets, nil
 }
 
-func processMessage(jq jsonq.JsonQuery) {
-	messageType, err := jq.String("message_type")
-	if err != nil || messageType != "certificate_update" {
-		return
-	}
-
-	domains, err := jq.ArrayOfStrings("data", "leaf_cert", "all_domains")
-	if err != nil {
-		return
-	}
-
-	for _, domain := range domains {
+func processEntry(entry CertEntry) {
+	for _, domain := range entry.Domains {
 		for _, target := range targets {
 			if strings.Contains(strings.ToLower(domain), strings.ToLower(target)) {
 				logger.Info("new subdomain", "domain", domain, "target", target)
