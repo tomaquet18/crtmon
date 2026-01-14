@@ -1,71 +1,125 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
-	"strings"
+	"time"
 
 	"github.com/blang/semver"
-	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/glamour"
+	charmlog "github.com/charmbracelet/log"
 	"github.com/rhysd/go-github-selfupdate/selfupdate"
 )
 
-func performUpdate() {
-	highlightStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
-	errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
-	successStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
-	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+var updateLogger = charmlog.NewWithOptions(os.Stderr, charmlog.Options{
+	ReportTimestamp: false,
+	Prefix:          "updating",
+})
 
-	fmt.Println()
-	fmt.Println(highlightStyle.Render("checking for updates..."))
+func performUpdate() {
+	printBanner()
 
 	latest, found, err := selfupdate.DetectLatest("coffinxp/crtmon")
 	if err != nil {
-		fmt.Printf("%s %s\n", errorStyle.Render("✗"), dimStyle.Render("error checking for updates: "+err.Error()))
-		fmt.Println()
+		printErr("failed to check for updates: " + err.Error())
 		os.Exit(1)
 	}
-
 	if !found {
-		fmt.Printf("%s %s\n", errorStyle.Render("✗"), dimStyle.Render("no releases found"))
-		fmt.Println()
+		printErr("no releases found")
 		os.Exit(1)
 	}
 
-	currentVersion := "v" + version
-	v, err := semver.ParseTolerant(strings.TrimPrefix(currentVersion, "v"))
+	current, err := semver.ParseTolerant(Version)
 	if err != nil {
-		fmt.Printf("%s %s\n", errorStyle.Render("✗"), dimStyle.Render("invalid version format: "+err.Error()))
-		fmt.Println()
+		printErr("invalid version: " + err.Error())
 		os.Exit(1)
 	}
 
-	if !latest.Version.GT(v) {
-		fmt.Printf("%s %s\n", successStyle.Render("✓"), dimStyle.Render("already up to date ("+currentVersion+")"))
-		fmt.Println()
+	if !latest.Version.GT(current) {
+		printInfo("crtmon already up to date v" + Version)
 		return
 	}
 
 	exe, err := os.Executable()
 	if err != nil {
-		fmt.Printf("%s %s\n", errorStyle.Render("✗"), dimStyle.Render("could not locate executable: "+err.Error()))
-		fmt.Println()
+		printErr("could not locate binary: " + err.Error())
 		os.Exit(1)
 	}
 
-	fmt.Printf("  %s → %s\n", dimStyle.Render(currentVersion), highlightStyle.Render(latest.Version.String()))
-	fmt.Println()
-	fmt.Print(dimStyle.Render("  updating... "))
+	printInfo(fmt.Sprintf("downloading v%s", latest.Version.String()))
 
-	if err := selfupdate.UpdateTo(latest.AssetURL, exe); err != nil {
-		fmt.Printf("%s\n", errorStyle.Render("failed"))
-		fmt.Printf("  %s\n", dimStyle.Render("error: "+err.Error()))
-		fmt.Println()
+	updater, _ := selfupdate.NewUpdater(selfupdate.Config{})
+	if err := updater.UpdateTo(latest, exe); err != nil {
+		printErr("update failed: " + err.Error())
 		os.Exit(1)
 	}
 
-	fmt.Printf("%s\n", successStyle.Render("done"))
+	printInfo(fmt.Sprintf("crtmon successfully updated v%s -> v%s (latest)", Version, latest.Version.String()))
 	fmt.Println()
-	fmt.Println(dimStyle.Render("  restart crtmon to use the new version"))
+
+	showChangelog("coffinxp/crtmon", latest.Version.String())
+}
+
+func printInfo(msg string) {
+	updateLogger.Info(msg)
+}
+
+func printErr(msg string) {
+	updateLogger.Error(msg)
+}
+
+func showChangelog(repo, version string) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/v%s", repo, version)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		updateLogger.Error("failed to fetch changelog", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		updateLogger.Warn("changelog not available", "status", resp.StatusCode)
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		updateLogger.Error("failed to read changelog", "error", err)
+		return
+	}
+
+	var release struct {
+		Body string `json:"body"`
+	}
+	if err := json.Unmarshal(body, &release); err != nil {
+		updateLogger.Error("failed to parse changelog", "error", err)
+		return
+	}
+
+	if release.Body == "" {
+		updateLogger.Warn("no changelog available for this release")
+		return
+	}
+
+	r, err := glamour.NewTermRenderer(glamour.WithAutoStyle())
+	if err != nil {
+		updateLogger.Error("failed to initialize markdown renderer", "error", err)
+		fmt.Println(release.Body)
+		return
+	}
+
+	rendered, err := r.Render(release.Body)
+	if err != nil {
+		updateLogger.Error("failed to render changelog", "error", err)
+		fmt.Println(release.Body)
+		return
+	}
+
 	fmt.Println()
+	fmt.Print(rendered)
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -35,6 +36,10 @@ type CTMonitor struct {
 
 func NewCTMonitor() *CTMonitor {
 	ctx, cancel := context.WithCancel(context.Background())
+	
+	log.SetOutput(io.Discard)
+	log.SetFlags(0)
+	
 	return &CTMonitor{
 		entryChan: make(chan CertEntry, 5000),
 		ctx:       ctx,
@@ -105,7 +110,7 @@ func (m *CTMonitor) monitorLog(logInfo *loglist3.Log) {
 		logURL = "https://" + logURL
 	}
 	logURL = strings.TrimSuffix(logURL, "/")
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	httpClient := &http.Client{Timeout: 180 * time.Second}
 
 	logClient, err := client.New(logURL, httpClient, jsonclient.Options{})
 	if err != nil {
@@ -120,7 +125,7 @@ func (m *CTMonitor) monitorLog(logInfo *loglist3.Log) {
 	}
 
 	opts := scanner.FetcherOptions{
-		BatchSize:     256,
+		BatchSize:     512,
 		ParallelFetch: 2,
 		StartIndex:    int64(sth.TreeSize),
 		EndIndex:      0,

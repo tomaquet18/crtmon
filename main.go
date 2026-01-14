@@ -5,30 +5,29 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 
-	"github.com/charmbracelet/log"
+	charmlog "github.com/charmbracelet/log"
 )
-
-const version = "1.1.0"
 
 var (
 	target      = flag.String("target", "", "target domain to monitor")
+	scope       = flag.String("scope", "", "scope keyword to filter subdomains")
 	configPath  = flag.String("config", "", "path to configuration file")
 	notify      = flag.String("notify", "", "notification provider: discord, telegram, both")
+	jsonOutput  = flag.Bool("json", false, "output raw JSON format to stdout")
 	showVersion = flag.Bool("version", false, "show version")
 	update      = flag.Bool("update", false, "update to latest version")
 	showHelp    = flag.Bool("h", false, "show help")
 	showHelp2   = flag.Bool("help", false, "show help")
-	logger      = log.NewWithOptions(os.Stderr, log.Options{
-		ReportTimestamp: true,
-		TimeFormat:      "15:04:05",
-		Level:           log.DebugLevel,
-	})
+	logger *charmlog.Logger
 	targets        []string
+	scopeFilter    string
 	webhookURL     string
 	telegramToken  string
 	telegramChatID string
@@ -37,13 +36,33 @@ var (
 )
 
 func main() {
+	flag.CommandLine.Usage = func() {
+		displayHelp()
+	}
 	flag.Parse()
+
+	if *jsonOutput {
+		logger = charmlog.NewWithOptions(os.Stderr, charmlog.Options{
+			ReportTimestamp: false,
+			Level:           charmlog.FatalLevel,
+		})
+		log.SetOutput(io.Discard)
+		log.SetFlags(0)
+	} else {
+		logger = charmlog.NewWithOptions(os.Stderr, charmlog.Options{
+			ReportTimestamp: true,
+			TimeFormat:      "15:04:05",
+			Level:           charmlog.DebugLevel,
+		})
+	}
 
 	if len(os.Args) > 1 {
 		validFlags := map[string]bool{
 			"-target": true,
+			"-scope": true,
 			"-config": true,
 			"-notify": true,
+			"-json": true,
 			"-version": true,
 			"-update": true,
 			"-h": true, "-help": true,
@@ -84,7 +103,9 @@ func main() {
 		return
 	}
 
-	printBanner()
+	if !*jsonOutput {
+		printBanner()
+	}
 
 	if *configPath != "" {
 		setConfigPath(*configPath)
@@ -158,10 +179,11 @@ func main() {
 	discordConfigured := webhookURL != ""
 	telegramConfigured := telegramToken != "" && telegramChatID != ""
 
+	scopeFilter = strings.TrimSpace(*scope)
+
 	notifyValue := strings.ToLower(strings.TrimSpace(*notify))
 	switch notifyValue {
 	case "":
-		// No notify flag - notifications off
 	case "discord":
 		if !discordConfigured {
 			logger.Fatal("notify=discord selected but discord webhook is not configured. please configure it in your configuration file (use -config for a custom path)")
@@ -172,20 +194,8 @@ func main() {
 			logger.Fatal("notify=telegram selected but telegram bot token/chat id are not configured. please configure them in your configuration file (use -config for a custom path)")
 		}
 		notifyTelegram = true
-	case "both":
-		if !discordConfigured && !telegramConfigured {
-			logger.Fatal("notify=both selected but neither discord nor telegram is configured")
-		}
-		if !discordConfigured {
-			logger.Warn("notify=both selected but discord webhook is not configured; falling back to telegram only")
-		}
-		if !telegramConfigured {
-			logger.Warn("notify=both selected but telegram bot token/chat id are not configured; falling back to discord only")
-		}
-		notifyDiscord = discordConfigured
-		notifyTelegram = telegramConfigured
 	default:
-		logger.Fatal("invalid value for -notify. valid options are: discord, telegram, both")
+		logger.Fatal("invalid value for -notify. valid options are: discord, telegram")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -199,8 +209,10 @@ func main() {
 	}()
 
 	logger.Info("starting crtmon")
-	for i, t := range targets {
-		fmt.Printf("         %d. %s\n", (i + 1), t)
+	if !*jsonOutput {
+		for i, t := range targets {
+			fmt.Printf("         %d. %s\n", (i + 1), t)
+		}
 	}
 
 	var notifyStatus string
@@ -282,11 +294,17 @@ func processEntry(entry CertEntry) {
 	for _, domain := range entry.Domains {
 		for _, target := range targets {
 			if strings.Contains(strings.ToLower(domain), strings.ToLower(target)) {
-				logger.Info("new subdomain", "domain", domain, "target", target)
+				if scopeFilter != "" && !strings.Contains(strings.ToLower(domain), strings.ToLower(scopeFilter)) {
+					continue
+				}
+				if *jsonOutput {
+					outputJSON(domain, target, entry)
+				} else {
+					logger.Info("new subdomain", "domain", domain, "target", target)
+				}
 				if notifyDiscord || notifyTelegram {
 					go sendToDiscord(domain, target)
 				}
-				break
 			}
 		}
 	}
