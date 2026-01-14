@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'version (1.2.3) or empty for auto +1'
+        description: 'version (e.g., 1.2.3)'
         required: false
         type: string
 
@@ -20,51 +20,35 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.24'
 
-      - name: Get version
+      - name: get version
         id: ver
-          run: |
-            if [ -n "${{ github.event.inputs.version }}" ]; then
-              VERSION="${{ github.event.inputs.version }}"
-            else
-              LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-              LATEST_VERSION=${LATEST_TAG#v}
-              IFS='.' read -r -a VERSION_PARTS <<< "$LATEST_VERSION"
-              MAJOR=${VERSION_PARTS[0]:-0}
-              MINOR=${VERSION_PARTS[1]:-0}
-              PATCH=${VERSION_PARTS[2]:-0}
-              PATCH=$((PATCH + 1))
-              VERSION="$MAJOR.$MINOR.$PATCH"
-            fi
-            
-            if ! [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "Invalid version format"
-              exit 1
-            fi
-            
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Tag release
         run: |
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions[bot]"
-          git tag -a v${{ steps.ver.outputs.version }} -m "v${{ steps.ver.outputs.version }}"
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+            VERSION=${LATEST_TAG#v}
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+            PATCH=$((PATCH + 1))
+            VERSION="$MAJOR.$MINOR.$PATCH"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - uses: ad-m/github-push-action@master
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          branch: ${{ github.ref }}
-          tags: true
-
-      - name: Build
+      - name: build
         run: make release VERSION=${{ steps.ver.outputs.version }}
 
-      - uses: softprops/action-gh-release@v1
+      - name: create tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a v${{ steps.ver.outputs.version }} -m "Release v${{ steps.ver.outputs.version }}"
+          git push origin v${{ steps.ver.outputs.version }}
+
+      - uses: softprops/action-gh-release@v2
         with:
-            tag_name: v${{ steps.ver.outputs.version }}
-            name: crtmon v${{ steps.ver.outputs.version }}
-            generate_release_notes: false
-            files: build/*
+          tag_name: v${{ steps.ver.outputs.version }}
+          files: build/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
