@@ -124,11 +124,16 @@ func (m *CTMonitor) monitorLog(logInfo *loglist3.Log) {
 		return
 	}
 
+	const backfill = 1000
+	start := int64(0)
+	if sth.TreeSize > backfill {
+		start = int64(sth.TreeSize - backfill)
+	}
+
 	opts := scanner.FetcherOptions{
-		BatchSize:     512,
-		ParallelFetch: 2,
-		StartIndex:    int64(sth.TreeSize),
-		EndIndex:      0,
+		BatchSize:     1,
+		ParallelFetch: 1,
+		StartIndex:    start,
 		Continuous:    true,
 	}
 
@@ -136,25 +141,14 @@ func (m *CTMonitor) monitorLog(logInfo *loglist3.Log) {
 
 	logger.Debug("monitoring CT log", "from", logInfo.Description)
 
-	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		default:
+	err = fetcher.Run(m.ctx, func(batch scanner.EntryBatch) {
+		for i, entry := range batch.Entries {
+			m.processEntry(entry, batch.Start+int64(i), logURL)
 		}
+	})
 
-		err := fetcher.Run(m.ctx, func(batch scanner.EntryBatch) {
-			for i, entry := range batch.Entries {
-				m.processEntry(entry, batch.Start+int64(i), logURL)
-			}
-		})
-
-		if err != nil {
-			if m.ctx.Err() != nil {
-				return
-			}
-			time.Sleep(5 * time.Second)
-		}
+	if err != nil && m.ctx.Err() == nil {
+		logger.Warn("fetcher stopped", "log", logInfo.Description, "error", err)
 	}
 }
 
