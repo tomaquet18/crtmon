@@ -1,4 +1,4 @@
-module github.com/coffinxp/crtmon
+module github.com/tomaquet18/crtmon
 
 go 1.24.0
 
